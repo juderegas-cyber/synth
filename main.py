@@ -356,10 +356,13 @@ print("=" * 50)
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-pressed_keys   = set()
-chord_playing  = False
-last_display   = time.ticks_ms()
-last_batt      = time.ticks_ms()
+pressed_keys         = set()
+chord_playing        = False
+last_display         = time.ticks_ms()
+last_batt            = time.ticks_ms()
+_release_time        = {}    # key -> ticks_ms when first seen released
+RELEASE_DEBOUNCE_MS  = 30    # ms a key must be absent before counted as released
+prev_chord_notes     = []    # notes from last envelope trigger (restart guard)
 
 try:
     while True:
@@ -397,12 +400,26 @@ try:
         _, vib_rate, vib_depth = read_pots()
         gui.update_controls(100, vib_rate, vib_depth)
 
-        # ── Scan keypad ───────────────────────────────────────────────────
-        states      = keypad.get_button_states()
-        new_pressed = set()
-        for i in range(16):
-            if states & (1 << i):
-                new_pressed.add(i)
+        # ── Scan keypad (debounced releases) ──────────────────────────────
+        # Presses register immediately.  Releases must be absent for
+        # RELEASE_DEBOUNCE_MS ms before they are accepted — this prevents
+        # button bounce from triggering spurious release+re-press cycles
+        # that would reset the envelope mid-note and cause audible jitter.
+        states = keypad.get_button_states()
+        raw    = set(i for i in range(16) if states & (1 << i))
+
+        for k in raw:                         # key active → clear release timer
+            _release_time.pop(k, None)
+        for k in pressed_keys - raw:          # newly absent → start release timer
+            if k not in _release_time:
+                _release_time[k] = now
+
+        new_pressed = set(raw)
+        for k in list(_release_time):
+            if time.ticks_diff(now, _release_time[k]) < RELEASE_DEBOUNCE_MS:
+                new_pressed.add(k)            # still within debounce window
+            else:
+                del _release_time[k]          # truly released
 
         # ── Key changes ───────────────────────────────────────────────────
         if new_pressed != pressed_keys:
@@ -427,8 +444,14 @@ try:
 
             if new_chord:
                 set_voices(notes)
-                env_amp   = 0
-                env_state = ENV_ATTACK
+                # Only restart the envelope from zero when the notes actually
+                # changed or when we were idle/releasing.  If the same chord
+                # is detected again (e.g. from residual bounce that slipped
+                # through the debounce window), leave the sustain phase alone.
+                if sorted(notes) != sorted(prev_chord_notes) or env_state in (ENV_IDLE, ENV_RELEASE):
+                    env_amp   = 0
+                    env_state = ENV_ATTACK
+                prev_chord_notes = list(notes)
                 chord_playing = True
                 gui.enter_info_mode()
             elif any_chord:
