@@ -38,8 +38,8 @@
 
 #define SPI_KEYPAD     spi0
 #define PIN_APA_CS     17   // not used by APA102 but set high
-#define PIN_APA_SCK     6   // Pimoroni keypad actual SCK pin
-#define PIN_APA_MOSI    7   // Pimoroni keypad actual MOSI pin
+#define PIN_APA_SCK     6   // Pimoroni keypad SCK
+#define PIN_APA_MOSI    3   // Pimoroni keypad MOSI
 
 #define I2C_BUS        i2c0
 #define PIN_I2C_SDA     4   // Pimoroni keypad I2C bus (GP4/GP5)
@@ -56,6 +56,12 @@
 #define POT_CH_VOL     0   // GP26 = ADC0
 #define POT_CH_RATE    1   // GP27 = ADC1
 #define POT_CH_DEPTH   2   // GP28 = ADC2
+
+// OLED (SH1106, I2C, shares I2C_BUS on GP4/GP5 — wire SDA→GP4, SCL→GP5)
+#define OLED_ADDR      0x3C
+#define OLED_W         128
+#define OLED_H         64
+#define OLED_PAGES     8    // 64 / 8
 
 // ── Audio constants ───────────────────────────────────────────────────────────
 
@@ -153,6 +159,10 @@ static uint8_t  press_count[16]   = {0};
 static uint8_t  release_count[16] = {0};
 #define PRESS_SCANS   3
 #define RELEASE_SCANS 5
+
+// ── OLED framebuffer ──────────────────────────────────────────────────────────
+
+static uint8_t oled_buf[OLED_W * OLED_PAGES];  // 1024 bytes
 
 // ── Encoder state ─────────────────────────────────────────────────────────────
 
@@ -538,6 +548,222 @@ static uint16_t mcp_read_buttons(void) {
     return (uint16_t)a | ((uint16_t)b << 8);
 }
 
+// ── SH1106 OLED driver (I2C, page-addressed) ─────────────────────────────────
+
+// 5×7 font, 5 bytes per glyph, each byte = column (bit 0 = topmost row)
+// Covers ASCII 0x20 ' ' through 0x5A 'Z'
+static const uint8_t font5x7[][5] = {
+    {0x00,0x00,0x00,0x00,0x00}, // ' '
+    {0x00,0x00,0x5F,0x00,0x00}, // '!'
+    {0x00,0x07,0x00,0x07,0x00}, // '"'
+    {0x14,0x7F,0x14,0x7F,0x14}, // '#'
+    {0x24,0x2A,0x7F,0x2A,0x12}, // '$'
+    {0x23,0x13,0x08,0x64,0x62}, // '%'
+    {0x36,0x49,0x55,0x22,0x50}, // '&'
+    {0x00,0x05,0x03,0x00,0x00}, // '\''
+    {0x00,0x1C,0x22,0x41,0x00}, // '('
+    {0x00,0x41,0x22,0x1C,0x00}, // ')'
+    {0x14,0x08,0x3E,0x08,0x14}, // '*'
+    {0x08,0x08,0x3E,0x08,0x08}, // '+'
+    {0x00,0x50,0x30,0x00,0x00}, // ','
+    {0x08,0x08,0x08,0x08,0x08}, // '-'
+    {0x00,0x60,0x60,0x00,0x00}, // '.'
+    {0x20,0x10,0x08,0x04,0x02}, // '/'
+    {0x3E,0x51,0x49,0x45,0x3E}, // '0'
+    {0x00,0x42,0x7F,0x40,0x00}, // '1'
+    {0x42,0x61,0x51,0x49,0x46}, // '2'
+    {0x21,0x41,0x45,0x4B,0x31}, // '3'
+    {0x18,0x14,0x12,0x7F,0x10}, // '4'
+    {0x27,0x45,0x45,0x45,0x39}, // '5'
+    {0x3C,0x4A,0x49,0x49,0x30}, // '6'
+    {0x01,0x71,0x09,0x05,0x03}, // '7'
+    {0x36,0x49,0x49,0x49,0x36}, // '8'
+    {0x06,0x49,0x49,0x29,0x1E}, // '9'
+    {0x00,0x36,0x36,0x00,0x00}, // ':'
+    {0x00,0x56,0x36,0x00,0x00}, // ';'
+    {0x08,0x14,0x22,0x41,0x00}, // '<'
+    {0x14,0x14,0x14,0x14,0x14}, // '='
+    {0x00,0x41,0x22,0x14,0x08}, // '>'
+    {0x02,0x01,0x51,0x09,0x06}, // '?'
+    {0x32,0x49,0x79,0x41,0x3E}, // '@'
+    {0x7E,0x11,0x11,0x11,0x7E}, // 'A'
+    {0x7F,0x49,0x49,0x49,0x36}, // 'B'
+    {0x3E,0x41,0x41,0x41,0x22}, // 'C'
+    {0x7F,0x41,0x41,0x22,0x1C}, // 'D'
+    {0x7F,0x49,0x49,0x49,0x41}, // 'E'
+    {0x7F,0x09,0x09,0x01,0x01}, // 'F'
+    {0x3E,0x41,0x49,0x49,0x7A}, // 'G'
+    {0x7F,0x08,0x08,0x08,0x7F}, // 'H'
+    {0x00,0x41,0x7F,0x41,0x00}, // 'I'
+    {0x20,0x40,0x41,0x3F,0x01}, // 'J'
+    {0x7F,0x08,0x14,0x22,0x41}, // 'K'
+    {0x7F,0x40,0x40,0x40,0x40}, // 'L'
+    {0x7F,0x02,0x0C,0x02,0x7F}, // 'M'
+    {0x7F,0x04,0x08,0x10,0x7F}, // 'N'
+    {0x3E,0x41,0x41,0x41,0x3E}, // 'O'
+    {0x7F,0x09,0x09,0x09,0x06}, // 'P'
+    {0x3E,0x41,0x51,0x21,0x5E}, // 'Q'
+    {0x7F,0x09,0x19,0x29,0x46}, // 'R'
+    {0x46,0x49,0x49,0x49,0x31}, // 'S'
+    {0x01,0x01,0x7F,0x01,0x01}, // 'T'
+    {0x3F,0x40,0x40,0x40,0x3F}, // 'U'
+    {0x1F,0x20,0x40,0x20,0x1F}, // 'V'
+    {0x3F,0x40,0x38,0x40,0x3F}, // 'W'
+    {0x63,0x14,0x08,0x14,0x63}, // 'X'
+    {0x07,0x08,0x70,0x08,0x07}, // 'Y'
+    {0x61,0x51,0x49,0x45,0x43}, // 'Z'
+};
+
+static void oled_cmd(uint8_t c) {
+    uint8_t buf[2] = {0x00, c};
+    i2c_write_blocking(I2C_BUS, OLED_ADDR, buf, 2, false);
+}
+
+static void oled_init(void) {
+    sleep_ms(10);
+    oled_cmd(0xAE);        // display off
+    oled_cmd(0xD5); oled_cmd(0x80); // clock divide
+    oled_cmd(0xA8); oled_cmd(0x3F); // multiplex 64
+    oled_cmd(0xD3); oled_cmd(0x00); // display offset 0
+    oled_cmd(0x40);        // start line 0
+    oled_cmd(0xAD); oled_cmd(0x8B); // internal charge pump (SH1106)
+    oled_cmd(0xA1);        // segment remap (mirror horiz)
+    oled_cmd(0xC8);        // COM scan reversed (mirror vert)
+    oled_cmd(0xDA); oled_cmd(0x12); // COM pins
+    oled_cmd(0x81); oled_cmd(0xCF); // contrast
+    oled_cmd(0xD9); oled_cmd(0xF1); // pre-charge
+    oled_cmd(0xDB); oled_cmd(0x40); // VCOM deselect
+    oled_cmd(0xA4);        // output follows RAM
+    oled_cmd(0xA6);        // normal (non-inverted)
+    oled_cmd(0xAF);        // display on
+    memset(oled_buf, 0, sizeof(oled_buf));
+    printf("OLED ready\n");
+}
+
+// Set a single pixel in the framebuffer
+static void oled_pixel(int x, int y, bool on) {
+    if ((unsigned)x >= OLED_W || (unsigned)y >= OLED_H) return;
+    int page = y >> 3;
+    int bit  = y & 7;
+    if (on) oled_buf[page * OLED_W + x] |=  (uint8_t)(1 << bit);
+    else    oled_buf[page * OLED_W + x] &= ~(uint8_t)(1 << bit);
+}
+
+// Draw a character at pixel position (x, y). Returns new x.
+static int oled_char(int x, int y, char c) {
+    if (c < ' ' || c > 'Z') c = ' ';
+    const uint8_t *g = font5x7[(uint8_t)(c - ' ')];
+    for (int col = 0; col < 5; col++) {
+        uint8_t bits = g[col];
+        for (int row = 0; row < 7; row++) {
+            if (bits & (1 << row)) oled_pixel(x + col, y + row, true);
+        }
+    }
+    return x + 6;  // 5px glyph + 1px gap
+}
+
+static void oled_str(int x, int y, const char *s) {
+    while (*s) x = oled_char(x, y, *s++);
+}
+
+// Push framebuffer to display (SH1106 page-addressed, 2-col offset)
+static void oled_flush(void) {
+    uint8_t row_buf[129];
+    row_buf[0] = 0x40;  // data mode control byte
+    for (int pg = 0; pg < OLED_PAGES; pg++) {
+        oled_cmd(0xB0 + pg);  // page address
+        oled_cmd(0x02);       // column low  (SH1106 starts at col 2)
+        oled_cmd(0x10);       // column high
+        memcpy(row_buf + 1, oled_buf + pg * OLED_W, OLED_W);
+        i2c_write_blocking(I2C_BUS, OLED_ADDR, row_buf, 129, false);
+    }
+}
+
+// Generate a 4-char label string for key k
+static void key_label(int k, char out[5]) {
+    static const char *drum_names[8] = {
+        "KICK","SNAR","HHAT","CLAP","TOM1","TOM2","TOM3","CYMB"
+    };
+    static const char *note_names[12] = {
+        "C","C#","D","D#","E","F","F#","G","G#","A","A#","B"
+    };
+    KeyAssign *a = &key_assign[k];
+    if (a->type == KEY_DRUM) {
+        memcpy(out, drum_names[a->root % 8], 4);
+        out[4] = '\0';
+        return;
+    }
+    // Chord: root note + type abbreviation
+    const char *note = note_names[a->root % 12];
+    const char *ctype = "??? ";
+    if      (a->n_intervals==3 && a->intervals[1]==4 && a->intervals[2]==7)  ctype = "MAJ";
+    else if (a->n_intervals==3 && a->intervals[1]==3 && a->intervals[2]==7)  ctype = "MIN";
+    else if (a->n_intervals==3 && a->intervals[1]==3 && a->intervals[2]==6)  ctype = "DIM";
+    else if (a->n_intervals==3 && a->intervals[1]==4 && a->intervals[2]==8)  ctype = "AUG";
+    else if (a->n_intervals==3 && a->intervals[1]==2 && a->intervals[2]==7)  ctype = "SS2";
+    else if (a->n_intervals==3 && a->intervals[1]==5 && a->intervals[2]==7)  ctype = "SS4";
+    else if (a->n_intervals==4 && a->intervals[3]==10)                       ctype = "DM7";
+    else if (a->n_intervals==4 && a->intervals[3]==11 && a->intervals[1]==4) ctype = "MM7";
+    else if (a->n_intervals==4 && a->intervals[3]==10 && a->intervals[1]==3) ctype = "MN7";
+    snprintf(out, 5, "%s%s", note, ctype);
+}
+
+// Draw the 4×4 key grid into oled_buf
+static void draw_grid(void) {
+    memset(oled_buf, 0, sizeof(oled_buf));
+    // Grid lines
+    for (int y = 0; y < OLED_H; y++) {
+        oled_pixel(0,  y, true);
+        oled_pixel(31, y, true);
+        oled_pixel(63, y, true);
+        oled_pixel(95, y, true);
+        oled_pixel(127,y, true);
+    }
+    for (int x = 0; x < OLED_W; x++) {
+        oled_pixel(x, 0,  true);
+        oled_pixel(x, 15, true);
+        oled_pixel(x, 31, true);
+        oled_pixel(x, 47, true);
+        oled_pixel(x, 63, true);
+    }
+    // Labels and press highlights
+    char label[5];
+    for (int row = 0; row < 4; row++) {
+        for (int col = 0; col < 4; col++) {
+            int k  = row * 4 + col;
+            int cx = col * 32;   // cell left edge (= border pixel)
+            int cy = row * 16;   // cell top edge  (= border pixel)
+            // Invert cell background if key is held
+            if (pressed_keys & (1 << k)) {
+                for (int px = cx+1; px < cx+31; px++)
+                    for (int py = cy+1; py < cy+15; py++)
+                        oled_pixel(px, py, true);
+            }
+            key_label(k, label);
+            // Clip label to 4 chars, uppercase only
+            for (int i = 0; i < 4 && label[i]; i++)
+                if (label[i] >= 'a' && label[i] <= 'z') label[i] -= 32;
+            label[4] = '\0';
+            int lw  = (int)strlen(label) * 6 - 1;
+            int tx  = cx + 1 + (30 - lw) / 2;  // centered in 30px inner width
+            int ty  = cy + 4;                    // 4px from top (7px font in 14px)
+            // If inverted, draw in "off" pixels so text is dark on bright bg
+            if (pressed_keys & (1 << k)) {
+                for (int c2 = 0; label[c2]; c2++) {
+                    if (label[c2] < ' ' || label[c2] > 'Z') { tx += 6; continue; }
+                    const uint8_t *g = font5x7[(uint8_t)(label[c2] - ' ')];
+                    for (int fc = 0; fc < 5; fc++)
+                        for (int fr = 0; fr < 7; fr++)
+                            if (g[fc] & (1 << fr)) oled_pixel(tx + fc, ty + fr, false);
+                    tx += 6;
+                }
+            } else {
+                oled_str(tx, ty, label);
+            }
+        }
+    }
+}
+
 // ── Drum synthesis ────────────────────────────────────────────────────────────
 
 static uint32_t ns = 99991;  // PRNG state
@@ -728,8 +954,11 @@ int main(void) {
     gpio_set_dir(PIN_APA_CS, GPIO_OUT);
     gpio_put(PIN_APA_CS, 1);    // CS active low; APA102 ignores CS but set high
 
-    // ── Keypad buttons (MCP23017 via I2C0) ───────────────────────────────
+    // ── Keypad buttons (TCA9555 via I2C0) ────────────────────────────────
     mcp_init();
+
+    // ── OLED display (SH1106 via I2C0 — wire SDA→GP4, SCL→GP5) ──────────
+    oled_init();
 
     // ── ADC ───────────────────────────────────────────────────────────────
     adc_init();
@@ -755,6 +984,7 @@ int main(void) {
     // ── Main loop ─────────────────────────────────────────────────────────
     uint32_t last_ui_ms   = to_ms_since_boot(get_absolute_time());
     uint32_t last_dbg_ms  = 0;   // debug print every 1 s
+    uint32_t last_disp_ms = 0;   // OLED refresh every 100 ms
 
     while (true) {
         // Fill audio if DMA interrupt requested it
@@ -843,6 +1073,13 @@ int main(void) {
                 }
             }
             refresh_leds();
+        }
+
+        // ── OLED refresh (~10 Hz) ─────────────────────────────────────
+        if (now - last_disp_ms >= 100) {
+            last_disp_ms = now;
+            draw_grid();
+            oled_flush();
         }
     }
 }
