@@ -1,0 +1,67 @@
+; i2s.pio  —  16-bit stereo I2S output (Pico as clock master)
+;
+; Pins
+;   out base  = DATA   (1 pin)
+;   side-set  = BCLK, LRCLK  (2 pins, must be consecutive: BCLK first, LRCLK second)
+;
+; OSR is 32-bit, autopull (threshold 32), MSB-first.
+; Each 32-bit word contains:
+;   bits 31..16  = left  channel sample (int16 cast to uint16)
+;   bits 15..0   = right channel sample
+;
+; State-machine clock = 1,024,000 Hz  →  64 cycles per stereo sample
+; For 16 kHz:  divider = 125,000,000 / 1,024,000 ≈ 122.07  (int=122, frac=18)
+
+.program i2s_out
+.side_set 2
+
+; side-set bit 1 = BCLK,  side-set bit 0 = LRCLK  (0=left, 1=right)
+
+public entry_point:
+    set x, 14          side 0b01   ; x=14, BCLK↑, LRCLK=0 (left)
+
+.wrap_target
+left_loop:
+    out pins, 1        side 0b00   ; data bit, BCLK↓
+    jmp x-- left_loop  side 0b01   ; BCLK↑, loop while x > 0
+    out pins, 1        side 0b10   ; 16th left bit, BCLK↓, LRCLK→1 (right)
+    set x, 14          side 0b11   ; x=14, BCLK↑, LRCLK=1
+right_loop:
+    out pins, 1        side 0b10   ; data bit, BCLK↓
+    jmp x-- right_loop side 0b11   ; BCLK↑, loop while x > 0
+    out pins, 1        side 0b00   ; 16th right bit, BCLK↓, LRCLK→0 (left)
+    set x, 14          side 0b01   ; x=14, BCLK↑, LRCLK=0
+.wrap
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void i2s_out_program_init(PIO pio, uint sm, uint offset,
+                                        uint pin_data, uint pin_bclk,
+                                        uint sample_rate) {
+    pio_sm_config c = i2s_out_program_get_default_config(offset);
+
+    // DATA on one pin, side-set on BCLK and LRCLK (must be consecutive)
+    sm_config_set_out_pins(&c, pin_data, 1);
+    sm_config_set_sideset_pins(&c, pin_bclk);
+
+    // Autopull every 32 bits, MSB first, shift left
+    sm_config_set_out_shift(&c, false, true, 32);
+
+    // PIO clock = sample_rate * 64 cycles/sample
+    float div = (float)clock_get_hz(clk_sys) / (sample_rate * 64.0f);
+    sm_config_set_clkdiv(&c, div);
+
+    // Set pin directions
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_data, 1, true);   // DATA out
+    pio_sm_set_consecutive_pindirs(pio, sm, pin_bclk, 2, true);   // BCLK, LRCLK out
+
+    // Connect GPIO to PIO
+    pio_gpio_init(pio, pin_data);
+    pio_gpio_init(pio, pin_bclk);
+    pio_gpio_init(pio, pin_bclk + 1);
+
+    pio_sm_init(pio, sm, offset + i2s_out_offset_entry_point, &c);
+    pio_sm_set_enabled(pio, sm, true);
+}
+%}

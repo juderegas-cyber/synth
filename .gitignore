@@ -1,0 +1,48 @@
+*.DS_Store
+
+# CMake generated files
+/build*/
+build/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+*.[o]
+*.tdb
+*.gcno
+*.gcda
+*.gcov
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_CPack_Packages/
+DartConfiguration.tcl
+labels.json
+log.txt
+*.vcxproj
+*.sln
+*.suo
+*.user
+*.config
+*.vscache
+CMakeUserPresets.json
+
+# IDE specific files
+# Visual Studio
+.vs/
+[Dd]ebug/
+[Rr]elease/
+*.VC.db
+*.VC.opendb
+
+# CLion
+/.idea/
+/cmake-build-*/
+
+# QtCreator
+/.qmake.stash/
+.qmake.cache
+*.pro.user.*
+*.pro.user
